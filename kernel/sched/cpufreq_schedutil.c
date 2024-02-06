@@ -48,6 +48,8 @@ struct sugov_policy {
 	bool			need_freq_update;
 };
 
+static DEFINE_PER_CPU(struct sugov_policy *, sugov_policy);
+
 struct sugov_cpu {
 	struct update_util_data	update_util;
 	struct sugov_policy	*sg_policy;
@@ -202,7 +204,7 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = arch_scale_freq_invariant() ?
-				policy->cpuinfo.max_freq : policy->cur;
+				policy->max : policy->cur;
 
 	freq = map_util_freq(util, freq, max);
 
@@ -237,15 +239,17 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
  * based on the task model parameters and gives the minimal utilization
  * required to meet deadlines.
  */
-unsigned long schedutil_freq_util(int cpu, unsigned long util,
-				  unsigned long max, enum schedutil_type type)
+unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
+				 unsigned long max, enum schedutil_type type,
+				 struct task_struct *p)
 {
-	unsigned long dl_util, irq;
+	unsigned long dl_util, util, irq;
 	struct rq *rq = cpu_rq(cpu);
 
-	if (sched_feat(SUGOV_RT_MAX_FREQ) && type == FREQUENCY_UTIL &&
-						rt_rq_is_runnable(&rq->rt))
+	if (sched_feat(SUGOV_RT_MAX_FREQ) && !IS_BUILTIN(CONFIG_UCLAMP_TASK) &&
+	    type == FREQUENCY_UTIL && rt_rq_is_runnable(&rq->rt)) {
 		return max;
+	}
 
 	/*
 	 * Early check to see if IRQ/steal time saturates the CPU, can be
@@ -257,11 +261,21 @@ unsigned long schedutil_freq_util(int cpu, unsigned long util,
 		return max;
 
 	/*
-	 * The function is called with @util defined as the aggregation (the
-	 * sum) of RT and CFS signals, hence leaving the special case of DL
-	 * to be delt with. The exact way of doing things depend on the calling
-	 * context.
+	 * Because the time spend on RT/DL tasks is visible as 'lost' time to
+	 * CFS tasks and we use the same metric to track the effective
+	 * utilization (PELT windows are synchronized) we can directly add them
+	 * to obtain the CPU's actual utilization.
+	 *
+	 * CFS and RT utilization can be boosted or capped, depending on
+	 * utilization clamp constraints requested by currently RUNNABLE
+	 * tasks.
+	 * When there are no CFS RUNNABLE tasks, clamps are released and
+	 * frequency will be gracefully reduced with the utilization decay.
 	 */
+	util = util_cfs + cpu_util_rt(rq);
+	if (type == FREQUENCY_UTIL)
+		util = uclamp_rq_util_with(rq, util, p);
+
 	dl_util = cpu_util_dl(rq);
 
 	/*
@@ -314,13 +328,22 @@ unsigned long schedutil_freq_util(int cpu, unsigned long util,
 static unsigned long sugov_get_util(struct sugov_cpu *sg_cpu)
 {
 	struct rq *rq = cpu_rq(sg_cpu->cpu);
-	unsigned long util = boosted_cpu_util(sg_cpu->cpu, cpu_util_rt(rq));
+#ifdef CONFIG_SCHED_TUNE
+	unsigned long util = stune_util(sg_cpu->cpu, cpu_util_rt(rq));
+#else
+	unsigned long util = cpu_util_freq(sg_cpu->cpu);
+#endif
+	//unsigned long util_cfs = util - cpu_util_rt(rq);
 	unsigned long max = arch_scale_cpu_capacity(NULL, sg_cpu->cpu);
 
 	sg_cpu->max = max;
 	sg_cpu->bw_dl = cpu_bw_dl(rq);
 
-	return schedutil_freq_util(sg_cpu->cpu, util, max, FREQUENCY_UTIL);
+	util = emstune_freq_boost(sg_cpu->cpu, util);
+
+	part_cpu_active_ratio(&util, &max, sg_cpu->cpu);
+
+	return schedutil_cpu_util(sg_cpu->cpu, util, max, FREQUENCY_UTIL, NULL);
 }
 
 /**
@@ -524,7 +547,7 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	unsigned long util = 0, max = 1;
 	unsigned int j;
 
-	for_each_cpu(j, policy->cpus) {
+	for_each_cpu_and(j, policy->related_cpus, cpu_online_mask) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
 		unsigned long j_util, j_max;
 
@@ -588,9 +611,11 @@ static void sugov_work(struct kthread_work *work)
 	sg_policy->work_in_progress = false;
 	raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 
+	down_write(&sg_policy->policy->rwsem);
 	mutex_lock(&sg_policy->work_lock);
 	__cpufreq_driver_target(sg_policy->policy, freq, CPUFREQ_RELATION_L);
 	mutex_unlock(&sg_policy->work_lock);
+	up_write(&sg_policy->policy->rwsem);
 }
 
 static void sugov_irq_work(struct irq_work *irq_work)
@@ -603,7 +628,6 @@ static void sugov_irq_work(struct irq_work *irq_work)
 }
 
 /************************** sysfs interface ************************/
-
 static struct sugov_tunables *global_tunables;
 static DEFINE_MUTEX(global_tunables_lock);
 
@@ -717,10 +741,10 @@ static int sugov_kthread_create(struct sugov_policy *sg_policy)
 	struct task_struct *thread;
 	struct sched_attr attr = {
 		.size		= sizeof(struct sched_attr),
-		.sched_policy	= SCHED_DEADLINE,
+		.sched_policy	= SCHED_FIFO,
 		.sched_flags	= SCHED_FLAG_SUGOV,
 		.sched_nice	= 0,
-		.sched_priority	= 0,
+		.sched_priority	= MAX_RT_PRIO / 4,
 		/*
 		 * Fake (unused) bandwidth; workaround to "fix"
 		 * priority inheritance.
@@ -754,7 +778,6 @@ static int sugov_kthread_create(struct sugov_policy *sg_policy)
 	}
 
 	sg_policy->thread = thread;
-	kthread_bind_mask(thread, policy->related_cpus);
 	init_irq_work(&sg_policy->irq_work, sugov_irq_work);
 	mutex_init(&sg_policy->work_lock);
 
@@ -800,10 +823,17 @@ static int sugov_init(struct cpufreq_policy *policy)
 	struct sugov_policy *sg_policy;
 	struct sugov_tunables *tunables;
 	int ret = 0;
+	int cpu;
 
 	/* State should be equivalent to EXIT */
 	if (policy->governor_data)
 		return -EBUSY;
+
+	sg_policy = per_cpu(sugov_policy, policy->cpu);
+	if (sg_policy) {
+		policy->governor_data = sg_policy;
+		return 0;
+	}
 
 	cpufreq_enable_fast_switch(policy);
 
@@ -843,6 +873,9 @@ static int sugov_init(struct cpufreq_policy *policy)
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
 
+	for_each_cpu(cpu, policy->related_cpus)
+		per_cpu(sugov_policy, cpu) = sg_policy;
+
 	ret = kobject_init_and_add(&tunables->attr_set.kobj, &sugov_tunables_ktype,
 				   get_governor_parent_kobj(policy), "%s",
 				   schedutil_gov.name);
@@ -877,6 +910,11 @@ static void sugov_exit(struct cpufreq_policy *policy)
 	struct sugov_policy *sg_policy = policy->governor_data;
 	struct sugov_tunables *tunables = sg_policy->tunables;
 	unsigned int count;
+
+	if (per_cpu(sugov_policy, policy->cpu)) {
+		policy->governor_data = NULL;
+		return;
+	}
 
 	mutex_lock(&global_tunables_lock);
 
@@ -941,10 +979,8 @@ static void sugov_stop(struct cpufreq_policy *policy)
 
 	synchronize_sched();
 
-	if (!policy->fast_switch_enabled) {
+	if (!policy->fast_switch_enabled)
 		irq_work_sync(&sg_policy->irq_work);
-		kthread_cancel_work_sync(&sg_policy->work);
-	}
 }
 
 static void sugov_limits(struct cpufreq_policy *policy)
@@ -972,6 +1008,37 @@ struct cpufreq_governor schedutil_gov = {
 };
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL
+unsigned long cpufreq_governor_get_util(unsigned int cpu)
+{
+	struct sugov_cpu *sg_cpu = &per_cpu(sugov_cpu, cpu);
+
+	if (!sg_cpu)
+		return 0;
+
+	return sugov_get_util(sg_cpu);
+}
+
+/* This function is for getting the calculated next freq. */
+unsigned int cpufreq_governor_get_freq(int cpu)
+{
+	struct sugov_policy *sg_policy;
+	unsigned int freq;
+	unsigned long flags;
+
+	if (cpu < 0)
+		return 0;
+
+	sg_policy = per_cpu(sugov_policy, cpu);
+	if (!sg_policy)
+		return 0;
+
+	raw_spin_lock_irqsave(&sg_policy->update_lock, flags);
+	freq = sg_policy->next_freq;
+	raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
+
+	return freq;
+}
+
 struct cpufreq_governor *cpufreq_default_governor(void)
 {
 	return &schedutil_gov;

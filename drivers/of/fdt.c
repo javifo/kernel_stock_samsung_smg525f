@@ -25,6 +25,8 @@
 #include <linux/debugfs.h>
 #include <linux/serial_core.h>
 #include <linux/sysfs.h>
+#include <linux/debug-snapshot.h>
+#include <linux/random.h>
 
 #include <asm/setup.h>  /* for COMMAND_LINE_SIZE */
 #include <asm/page.h>
@@ -78,6 +80,33 @@ void of_fdt_limit_memory(int limit)
 		}
 	}
 }
+
+/**
+ * of_fdt_get_ddrtype - Return the type of ddr (4/5) on the current device
+ *
+ * On match, returns a non-zero positive value which matches the ddr type.
+ * Otherwise returns -ENOENT.
+ */
+int of_fdt_get_ddrtype(void)
+{
+	int memory;
+	int len;
+	int ret;
+	fdt32_t *prop = NULL;
+
+	memory = fdt_path_offset(initial_boot_params, "/memory");
+	if (memory > 0)
+		prop = fdt_getprop_w(initial_boot_params, memory,
+				  "ddr_device_type", &len);
+
+	if (!prop || len != sizeof(u32))
+		return -ENOENT;
+
+	ret = fdt32_to_cpu(*prop);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(of_fdt_get_ddrtype);
 
 /**
  * of_fdt_is_compatible - Return true if given node from the given blob has
@@ -574,6 +603,9 @@ static int __init __reserved_mem_reserve_reg(unsigned long node,
 		base = dt_mem_next_cell(dt_root_addr_cells, &prop);
 		size = dt_mem_next_cell(dt_root_size_cells, &prop);
 
+		if (dbg_snapshot_reserved_mem_check(node, (unsigned long)size))
+			return -EINVAL;
+
 		if (size &&
 		    early_init_dt_reserve_memory_arch(base, size, nomap) == 0)
 			pr_debug("Reserved memory: reserved region for node '%s': base %pa, size %ld MiB\n",
@@ -672,6 +704,7 @@ void __init early_init_fdt_scan_reserved_mem(void)
 		if (!size)
 			break;
 		early_init_dt_reserve_memory_arch(base, size, 0);
+		record_memsize_reserved(NULL, base, size, 0, 0);
 	}
 
 	of_scan_flat_dt(__fdt_scan_reserved_mem, NULL);
@@ -1101,6 +1134,7 @@ int __init early_init_dt_scan_chosen(unsigned long node, const char *uname,
 	int l = 0;
 	const char *p = NULL;
 	char *cmdline = data;
+	const void *rng_seed;
 
 	pr_debug("search \"chosen\", depth: %d, uname: %s\n", depth, uname);
 
@@ -1134,6 +1168,14 @@ int __init early_init_dt_scan_chosen(unsigned long node, const char *uname,
 	}
 
 	pr_debug("Command line is: %s\n", (char*)data);
+
+	rng_seed = of_get_flat_dt_prop(node, "rng-seed", &l);
+	if (rng_seed && l > 0) {
+		add_bootloader_randomness(rng_seed, l);
+
+		/* try to clear seed so it won't be found. */
+		fdt_nop_property(initial_boot_params, node, "rng-seed");
+	}
 
 	/* break now */
 	return 1;
@@ -1237,8 +1279,6 @@ bool __init early_init_dt_verify(void *params)
 
 	/* Setup flat device-tree pointer */
 	initial_boot_params = params;
-	of_fdt_crc32 = crc32_be(~0, initial_boot_params,
-				fdt_totalsize(initial_boot_params));
 	return true;
 }
 
@@ -1253,6 +1293,7 @@ void __init early_init_dt_scan_nodes(void)
 
 	/* Setup memory, calling early_init_dt_add_memory_arch */
 	of_scan_flat_dt(early_init_dt_scan_memory, NULL);
+	record_memsize_memory_hole();
 }
 
 bool __init early_init_dt_scan(void *params)
@@ -1264,6 +1305,8 @@ bool __init early_init_dt_scan(void *params)
 		return false;
 
 	early_init_dt_scan_nodes();
+	of_fdt_crc32 = crc32_be(~0, initial_boot_params,
+				fdt_totalsize(initial_boot_params));
 	return true;
 }
 
